@@ -13,6 +13,7 @@ import {
   ForbiddenError,
   type Prompt,
   GetPromptSchema,
+  GetPromptVersionsSchema,
   LegacyCreatePromptSchema,
   PRODUCTION_LABEL,
 } from "@langfuse/shared";
@@ -57,6 +58,7 @@ export default async function handler(
       const projectId = authCheck.scope.projectId;
       const promptName = searchParams.name;
       const version = searchParams.version ?? undefined;
+      const allVersions = searchParams.allVersions ?? false;
 
       const rateLimitCheck =
         await RateLimitService.getInstance().rateLimitRequest(
@@ -70,6 +72,44 @@ export default async function handler(
 
       const promptService = new PromptService(prisma, redis, recordIncrement);
 
+      // Handle request for all versions
+      if (allVersions) {
+        const prompts = await prisma.prompt.findMany({
+          where: {
+            projectId,
+            name: promptName,
+          },
+          orderBy: [
+            { version: "desc" }, // Latest versions first
+            { createdAt: "desc" },
+          ],
+        });
+
+        if (prompts.length === 0) {
+          throw new LangfuseNotFoundError("No versions found for the specified prompt name");
+        }
+
+        // Resolve all prompts (handle dependencies if any)
+        const resolvedPrompts = await Promise.all(
+          prompts.map(async (prompt) => {
+            const resolvedPrompt = await promptService.resolvePrompt(prompt);
+            return {
+              ...resolvedPrompt,
+              isActive: resolvedPrompt?.labels.includes(PRODUCTION_LABEL) ?? false,
+            };
+          }),
+        );
+
+        return res.status(200).json({
+          data: resolvedPrompts,
+          meta: {
+            totalVersions: prompts.length,
+            promptName: promptName,
+          },
+        });
+      }
+
+      // Handle request for single version
       let prompt: Prompt | null = null;
 
       if (version) {

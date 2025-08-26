@@ -91,6 +91,7 @@ export type GetPromptsMetaType = z.infer<typeof GetPromptsMetaSchema>;
 export const GetPromptSchema = z.object({
   name: z.string().transform((v) => decodeURIComponent(v)),
   version: z.coerce.number().int().nullish(),
+  allVersions: z.coerce.boolean().optional(),
 });
 
 export const GetPromptByNameSchema = z.object({
@@ -98,6 +99,12 @@ export const GetPromptByNameSchema = z.object({
   version: z.coerce.number().int().nullish(),
   label: z.string().optional(),
 });
+
+export const GetPromptVersionsSchema = z.object({
+  name: z.string().transform((v) => decodeURIComponent(v)),
+});
+
+export type GetPromptVersionsType = z.infer<typeof GetPromptVersionsSchema>;
 
 const BaseTextPromptSchema = z.object({
   id: z.string(),
