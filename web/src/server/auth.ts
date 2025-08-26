@@ -202,6 +202,7 @@ if (
       },
       client: {
         token_endpoint_auth_method: env.AUTH_CUSTOM_CLIENT_AUTH_METHOD,
+        id_token_signed_response_alg: env.AUTH_CUSTOM_ID_TOKEN_SIGNED_RESPONSE_ALG ?? "RS256",
       },
       checks: env.AUTH_CUSTOM_CHECKS,
     }),
