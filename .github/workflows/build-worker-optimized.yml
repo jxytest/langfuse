@@ -1,4 +1,4 @@
-name: Build and Push Web Image
+name: Build and Push Worker Image (Optimized)
 
 on:
   push:
@@ -21,11 +21,12 @@ on:
 env:
   REGISTRY: ${{ vars.ALI_REGISTRY || 'registry.cn-hangzhou.aliyuncs.com' }}
   NAMESPACE: ${{ vars.ALI_NAMESPACE || 'langfuse' }}
-  IMAGE_NAME: web
+  IMAGE_NAME: worker
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    timeout-minutes: 30  # Worker构建更快，设置较短超时
     
     steps:
     - name: Checkout code
@@ -57,8 +58,14 @@ jobs:
         echo "Commit ID: $COMMIT_ID"
         echo "Image Tag: ${VERSION}-${COMMIT_ID}"
 
+    # 🚀 优化点1: 提前设置Docker Buildx，使用更优配置
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
+      with:
+        driver-opts: |
+          network=host
+          image=moby/buildkit:buildx-stable-1
+        buildkitd-flags: --allow-insecure-entitlement security.insecure --allow-insecure-entitlement network.host
 
     - name: Login to Alibaba Cloud Container Registry
       uses: docker/login-action@v3
@@ -67,22 +74,72 @@ jobs:
         username: ${{ secrets.ALI_REGISTRY_USERNAME }}
         password: ${{ secrets.ALI_REGISTRY_PASSWORD }}
 
+    # 🚀 优化点2: 激进的磁盘清理，为Worker构建腾出空间
+    - name: Free up disk space
+      run: |
+        # 清理系统缓存
+        sudo apt-get clean
+        sudo apt-get autoremove -y
+        sudo journalctl --rotate
+        sudo journalctl --vacuum-time=1s
+        
+        # 清理大型工具链
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /usr/local/lib/android  
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+        sudo rm -rf /opt/hostedtoolcache/go
+        sudo rm -rf /opt/hostedtoolcache/Python
+        sudo rm -rf /usr/local/share/boost
+        sudo rm -rf /usr/local/lib/node_modules
+        sudo rm -rf /tmp/*
+        
+        # 清理Docker和系统
+        sudo docker system prune -af --volumes
+        sudo apt-get autoclean
+        
+        echo "剩余磁盘空间:"
+        df -h
+
+    # 🚀 优化点3: 高效缓存策略构建
     - name: Build and push Docker image
       uses: docker/build-push-action@v5
       with:
         context: .
-        file: ./web/Dockerfile
+        file: ./worker/Dockerfile
         push: true
         tags: |
           ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.image_tag }}
           ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:latest
-        platforms: linux/amd64,linux/arm64
-        cache-from: type=gha
-        cache-to: type=gha,mode=max
+        
+        # 🚀 优化点4: 优先构建amd64，按需构建arm64
+        platforms: |
+          ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
+        
+        # 🚀 优化点5: 多层级缓存策略
+        cache-from: |
+          type=gha
+          type=registry,ref=${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:cache
+        cache-to: |
+          type=gha,mode=max
+          type=registry,ref=${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:cache,mode=max
+        
+        build-args: |
+          BUILDKIT_INLINE_CACHE=1
+          NEXT_PUBLIC_BUILD_ID=${{ steps.version.outputs.image_tag }}
+        
+        # 🚀 优化点6: 禁用证明生成，加速构建
+        provenance: false
+        sbom: false
+        outputs: type=registry
+        
+        # 🚀 优化点7: 使用内联缓存和压缩输出
+        build-contexts: |
+          alpine=docker-image://node:20-alpine
 
     - name: Output image info
       run: |
-        echo "### 🚀 镜像构建成功" >> $GITHUB_STEP_SUMMARY
+        echo "### 🚀 Worker镜像构建成功" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "**镜像地址:**" >> $GITHUB_STEP_SUMMARY
         echo "- \`${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.image_tag }}\`" >> $GITHUB_STEP_SUMMARY
@@ -92,3 +149,4 @@ jobs:
         echo "- 版本号: \`${{ steps.version.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
         echo "- 提交ID: \`${{ steps.version.outputs.commit_id }}\`" >> $GITHUB_STEP_SUMMARY
         echo "- 分支: \`${{ github.event.inputs.branch || github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- 构建平台: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && 'linux/amd64, linux/arm64' || 'linux/amd64 only (优化版本)' }}" >> $GITHUB_STEP_SUMMARY

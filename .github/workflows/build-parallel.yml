@@ -1,0 +1,223 @@
+name: Build and Push Both Images (Parallel)
+
+on:
+  # push:
+  #   branches:
+  #     - main
+  #   tags:
+  #     - 'release-v*'
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to build from'
+        required: true
+        default: 'main'
+        type: string
+      version:
+        description: 'Version number'
+        required: true
+        type: string
+      build_web:
+        description: 'Build web image'
+        type: boolean
+        default: true
+      build_worker:
+        description: 'Build worker image'
+        type: boolean
+        default: true
+
+env:
+  REGISTRY: ${{ vars.ALI_REGISTRY || 'registry.cn-hangzhou.aliyuncs.com' }}
+  NAMESPACE: ${{ vars.ALI_NAMESPACE || 'langfuse' }}
+
+# 🚀 关键优化：并发控制，避免资源冲突
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 🚀 预处理作业：准备版本和共享信息
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      commit_id: ${{ steps.version.outputs.commit_id }}
+      image_tag: ${{ steps.version.outputs.image_tag }}
+      should_build_web: ${{ steps.conditions.outputs.should_build_web }}
+      should_build_worker: ${{ steps.conditions.outputs.should_build_worker }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.inputs.branch || github.ref }}
+        fetch-depth: 0
+
+    - name: Get version and commit info
+      id: version
+      run: |
+        COMMIT_ID=$(git rev-parse --short=6 HEAD)
+        echo "commit_id=$COMMIT_ID" >> $GITHUB_OUTPUT
+        
+        if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          VERSION="${{ github.event.inputs.version }}"
+        elif [[ "${{ github.ref }}" == refs/tags/release-v* ]]; then
+          VERSION=$(echo ${{ github.ref }} | sed 's/refs\/tags\/release-v//')
+        else
+          VERSION="latest"
+        fi
+        
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "image_tag=${VERSION}-${COMMIT_ID}" >> $GITHUB_OUTPUT
+
+    - name: Determine build conditions
+      id: conditions
+      run: |
+        if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          echo "should_build_web=${{ github.event.inputs.build_web }}" >> $GITHUB_OUTPUT
+          echo "should_build_worker=${{ github.event.inputs.build_worker }}" >> $GITHUB_OUTPUT
+        else
+          echo "should_build_web=true" >> $GITHUB_OUTPUT
+          echo "should_build_worker=true" >> $GITHUB_OUTPUT
+        fi
+
+  # 🚀 并行构建Web镜像
+  build-web:
+    needs: prepare
+    if: needs.prepare.outputs.should_build_web == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.inputs.branch || github.ref }}
+        fetch-depth: 0
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      with:
+        driver-opts: network=host
+        buildkitd-flags: --allow-insecure-entitlement security.insecure
+
+    - name: Login to Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ secrets.ALI_REGISTRY_USERNAME }}
+        password: ${{ secrets.ALI_REGISTRY_PASSWORD }}
+
+    - name: Free up disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+        sudo docker system prune -af --volumes
+        df -h
+
+    - name: Build and push web image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./web/Dockerfile
+        push: true
+        tags: |
+          ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/web:${{ needs.prepare.outputs.image_tag }}
+          ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/web:latest
+        platforms: linux/amd64
+        cache-from: |
+          type=gha,scope=web
+          type=registry,ref=${{ env.REGISTRY }}/${{ env.NAMESPACE }}/web:cache
+        cache-to: |
+          type=gha,mode=max,scope=web
+          type=registry,ref=${{ env.REGISTRY }}/${{ env.NAMESPACE }}/web:cache,mode=max
+        build-args: |
+          NEXT_PUBLIC_BUILD_ID=${{ needs.prepare.outputs.image_tag }}
+          BUILDKIT_INLINE_CACHE=1
+        provenance: false
+        sbom: false
+
+  # 🚀 并行构建Worker镜像
+  build-worker:
+    needs: prepare
+    if: needs.prepare.outputs.should_build_worker == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.inputs.branch || github.ref }}
+        fetch-depth: 0
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      with:
+        driver-opts: network=host
+        buildkitd-flags: --allow-insecure-entitlement security.insecure
+
+    - name: Login to Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ secrets.ALI_REGISTRY_USERNAME }}
+        password: ${{ secrets.ALI_REGISTRY_PASSWORD }}
+
+    - name: Free up disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+        sudo docker system prune -af --volumes
+        df -h
+
+    - name: Build and push worker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./worker/Dockerfile
+        push: true
+        tags: |
+          ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/worker:${{ needs.prepare.outputs.image_tag }}
+          ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/worker:latest
+        # 只在release tag时构建多平台
+        platforms: |
+          ${{ startsWith(github.ref, 'refs/tags/') && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
+        cache-from: |
+          type=gha,scope=worker
+          type=registry,ref=${{ env.REGISTRY }}/${{ env.NAMESPACE }}/worker:cache
+        cache-to: |
+          type=gha,mode=max,scope=worker
+          type=registry,ref=${{ env.REGISTRY }}/${{ env.NAMESPACE }}/worker:cache,mode=max
+        build-args: |
+          NEXT_PUBLIC_BUILD_ID=${{ needs.prepare.outputs.image_tag }}
+          BUILDKIT_INLINE_CACHE=1
+        provenance: false
+        sbom: false
+
+  # 🚀 总结作业
+  summary:
+    needs: [prepare, build-web, build-worker]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+    - name: Build Summary
+      run: |
+        echo "### 🚀 镜像构建总结" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**版本信息:**" >> $GITHUB_STEP_SUMMARY
+        echo "- 版本号: \`${{ needs.prepare.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- 提交ID: \`${{ needs.prepare.outputs.commit_id }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- 镜像标签: \`${{ needs.prepare.outputs.image_tag }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**构建状态:**" >> $GITHUB_STEP_SUMMARY
+        echo "- Web镜像: ${{ needs.build-web.result == 'success' && '✅ 成功' || needs.build-web.result == 'skipped' && '⏭️ 跳过' || '❌ 失败' }}" >> $GITHUB_STEP_SUMMARY
+        echo "- Worker镜像: ${{ needs.build-worker.result == 'success' && '✅ 成功' || needs.build-worker.result == 'skipped' && '⏭️ 跳过' || '❌ 失败' }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        if [[ "${{ needs.build-web.result }}" == "success" ]]; then
+          echo "**Web镜像地址:**" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ env.REGISTRY }}/${{ env.NAMESPACE }}/web:${{ needs.prepare.outputs.image_tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ env.REGISTRY }}/${{ env.NAMESPACE }}/web:latest\`" >> $GITHUB_STEP_SUMMARY
+        fi
+        if [[ "${{ needs.build-worker.result }}" == "success" ]]; then
+          echo "**Worker镜像地址:**" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ env.REGISTRY }}/${{ env.NAMESPACE }}/worker:${{ needs.prepare.outputs.image_tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ env.REGISTRY }}/${{ env.NAMESPACE }}/worker:latest\`" >> $GITHUB_STEP_SUMMARY
+        fi
